@@ -1,0 +1,146 @@
+
+Zweck
+Das Programm löst ein Reihenfolge- und Kapazitätsproblem in der Fahrzeugfertigung im TMC Wittlich: Mehrere Fahrzeuge müssen durch mehrere Abteilungen (Demo: Karosserie, Lack, Elektrik; Excel: Aufbau, Fgest, FHS, Lack, Elektrik), jede Abteilung hat begrenzt Mitarbeiter, jedes Fahrzeug eine Deadline. Gesucht ist der Belegungsplan — wer arbeitet an welchem Tag mit wie vielen Leuten an welchem Fahrzeug.
+
+Gelöst wird das als gemischt-ganzzahliges lineares Programm (MILP) mit HiGHS, das über WebAssembly in einem Web Worker läuft (nicht mehr im Haupt-Thread), damit die Seite während der Berechnung reagieren bleibt.
+
+So funktioniert es (Ablauf)
+Bedienung
+1. Server starten: im Projektordner `npm start` oder Doppelklick auf start.bat (in PowerShell: .\start.bat). Das Fenster muss offen bleiben. `npm start` startet den Server mit `node --watch`: Änderungen an server.js, Fahrzeuge.js, excel.js oder db.js laden den Server automatisch neu (vorher musste man ihn von Hand neu starten). Nach Änderungen an solver.js, index.html oder style.css genügt Strg+F5 im Browser. Meldet die Ausgabe „Server läuft noch mit altem Stand“, wurde der Server vor einer Änderung gestartet und muss neu gestartet werden.
+2. Im Browser http://localhost:3000 öffnen. Nicht über Live Server (Port 5501) oder per Doppelklick auf index.html: dort gibt es die API nicht, und es erscheinen nur die Demo-Daten.
+3. Optional oben die Felder ändern:
+   - „Mitarbeiter pro Tag“ je Abteilung (Standard 3)
+   - „Max. Mitarbeiter pro Fahrzeug und Abteilung“ (Standard 2)
+   - „Berechnungsdatum (Tag 1 des Plans)“ (Standard: heute) — damit lässt sich für unterschiedliche Starttage am selben Tag rechnen, ohne den Kalender abzuwarten
+   - „Zeithorizont für Fahrzeuge“ (Standard 180 Kalendertage) — steuert, welche Fahrzeuge überhaupt in die Planung kommen (siehe „Excel-Fallback im Detail“)
+   - „Laufzeit bis der Solver abbricht“ (Standard 120 Sekunden) — Zeitlimit für HiGHS
+4. „Optimierung starten“ klicken. Mit „Abbrechen“ lässt sich eine laufende Berechnung beenden. Danach erscheinen zuerst der Planungshorizont T, dann die Tagesliste, die Deadline-Auswertung, das Gantt-Diagramm und die Auslastung pro Woche; mit den Abteilungs-Buttons über dem Gantt lässt sich dieses nach Abteilungen filtern.
+
+Was dabei im Hintergrund passiert
+1. index.html lädt solver.js als ES-Modul. Der Klick ruft runSolver() auf.
+2. solver.js sammelt die Werte der Eingabefelder und ruft /api/planung?kap_<Abteilung>=…&max_fzg=…&horizont=…&start=… auf (start nur, wenn ein Berechnungsdatum gesetzt ist).
+3. server.js (Express) reicht die Anfrage an Fahrzeuge.js weiter. Dort wird zuerst die Oracle-DB versucht (db.js, Zugangsdaten aus .env). Schlägt das fehl, wird stattdessen die Excel-Datei verwendet. Auf dem Server steht dann „DB nicht verfuegbar … - nutze Excel-Daten.“ – das ist der Normalfall, solange DB_CONNECT nicht stimmt.
+4. Für Excel liest excel.js beim ersten Mal die xlsx (ca. 30 s), filtert die passenden Aufträge und speichert sie als daten/auftraege.json. Danach kommt die Antwort in Millisekunden aus dieser JSON.
+5. excelToModel (Fahrzeuge.js) wählt daraus die Fahrzeuge im Zeithorizont aus und macht daraus die Modelldaten: Fahrzeuge, Abteilungen, Aufwand in Mitarbeiter-Tagen, Deadline als Werktag-Nummer, erster Bearbeitungstag je Fahrzeug (Anlieferung), Kapazität, Planungshorizont T, Anzeigenamen/Status/ZAP-Kennzeichen und Startdatum. Sie gehen als JSON zurück an den Browser.
+6. solver.js baut daraus mit baueModell() das solver-unabhängige Modell, wandelt es mit zuHighsModell() in ein numerisches HiGHS-Modell um und schickt es an highs-worker.js (Web Worker), der HiGHS (WebAssembly) laedt und loest. Das Ergebnis kommt per postMessage zurueck.
+7. Das Ergebnis wird als Tagesliste, Deadline-Auswertung und Gantt-Diagramm ausgegeben.
+Bei jedem Klick wird neu geladen und neu gerechnet; geänderte Feldwerte gelten also sofort.
+
+Dateien
+- index.html – Oberfläche: Eingabefelder, Button, Ausgabe, Gantt.
+- style.css – alle Styles (früher im <style>-Block von index.html).
+- solver.js – Modell (baueModell, zuHighsModell), Worker-Aufruf, Ausgabe, Gantt, Demo-Daten.
+- highs-worker.js – Web Worker: laedt HiGHS (WebAssembly) und loest das Modell (loeseMitHighs aus solver.js), ohne den Haupt-Thread zu blockieren.
+- server.js – Express-Server, liefert die Seite aus und bindet die API ein.
+- Fahrzeuge.js – API /api/planung: DB-Abfrage, Excel-Fallback, Auswahl der Fahrzeuge, Umrechnung in Modelldaten.
+- db.js – Oracle-Verbindung (nur serverseitig).
+- excel.js – liest die xlsx und pflegt den JSON-Cache (daten/auftraege.json).
+- test-solver.mjs – Modelltests ohne Browser (npm test).
+- start.bat – Server starten und Browser öffnen.
+
+Das Modell in solver.js (baueModell)
+Grundregel: Ein Fahrzeug wird fertig gemacht, dann kommt das nächste. Die Arbeit einer Abteilung an einem Fahrzeug ist ein zusammenhängender Block — sie wird nicht unterbrochen, um zwischendurch an einem anderen Fahrzeug zu arbeiten.
+
+Deshalb gibt es je Fahrzeug i und Abteilung j mit Aufwand > 0 Blockvarianten u_i_j_w_s (binär): „ab Starttag s arbeiten w Mitarbeiter pro Tag, am letzten Tag der Rest“. Beispiel Aufwand 5 Mitarbeiter-Tage: w = 2 ergibt 2, 2, 1 an drei aufeinanderfolgenden Tagen; w = 1 ergibt 1, 1, 1, 1, 1 an fünf Tagen. w geht von 1 bis zum Minimum aus Kapazität der Abteilung und „Max. Mitarbeiter pro Fahrzeug und Abteilung“ (Standard 2). Der Starttag s läuft frühestens ab dem Tag, an dem das Fahrzeug angeliefert ist (verfuegbarAb, s. u.), und so lange, wie der Block noch in den Planungshorizont T passt. Genau eine Variante wird gewählt. Für Fahrzeug/Abteilung-Paare ohne Aufwand werden gar keine Variablen angelegt — sie wären ohnehin immer 0 und würden das Modell nur unnötig vergrößern.
+
+Anlieferung: Vor der Anlieferung darf an einem Fahrzeug nicht gearbeitet werden. Die Tagesvariablen x_i_j_t/z_i_j_t sind für Tage vor dem ersten Bearbeitungstag (verfuegbarAb[i]) fest auf 0 gesetzt, und Blockvarianten starten frühestens an diesem Tag. Für bereits angelieferte Fahrzeuge ist das Tag 1, sonst der (auf den nächsten Werktag gerundete) Tag der geplanten Anlieferung (AUF_DAT_ANLIEF_AKT, siehe „Excel-Fallback im Detail“).
+
+Aus der gewählten Blockvariante folgen die Mitarbeiter je Tag:
+x_i_j_t — Mitarbeiter an Tag t bis zur Deadline des Fahrzeugs
+z_i_j_t — Mitarbeiter NACH der Deadline (für jeden Tag existiert nur eine der beiden Variablen)
+Ausgabe, Gantt und Auslastung lesen nur x und z.
+
+Zielfunktion (vereinfacht): MIN Σ coef(i,t) · x_i_j_t + Σ (STRAFKOSTEN + t · VERSPAETUNGS_AUFSCHLAG) · z_i_j_t, mit
+coef(i,t) = t für Tage vor der Deadline von Fahrzeug i, PUFFERSTRAFE = T+1 für den Deadline-Tag selbst.
+
+Reguläre Arbeit (x, bis einschließlich zur Deadline) wird mit dem Tag gewichtet, an dem sie stattfindet: späte Arbeit ist „teurer“, also zieht der Solver alles so früh wie möglich nach vorn. Der Deadline-Tag selbst kostet zusätzlich einen Aufschlag (PUFFERSTRAFE = T+1 Werktage, teurer als jeder normale Tag, aber deutlich billiger als echte Verspätung): das Ziel ist, möglichst 1 Tag vor der Deadline fertig zu sein statt erst am Deadline-Tag selbst. Ist dafür kein früherer Tag mehr frei, plant der Solver trotzdem noch pünktlich auf dem Deadline-Tag - der Puffer ist ein weicher Wunsch, keine harte Grenze.
+
+Verspätete Arbeit (z, nach der Deadline) kostet pro Mitarbeiter-Tag eine feste Grundstrafe (STRAFKOSTEN = 1000, bewusst deutlich größer als die regulären Kosten) und wird daher nur gewählt, wenn eine Deadline nicht zu halten ist. Das Modell ist dadurch nie „unlösbar wegen Deadline“, sondern liefert einen Plan mit Verzug. Oben auf die Grundstrafe kommt ein winziger, mit dem Tag wachsender Aufschlag (VERSPAETUNGS_AUFSCHLAG = 1 / (2·T)): über den ganzen Horizont summiert bleibt er unter 1 - also immer kleiner als die Kosten, eine puenktliche Arbeit auch nur um einen einzigen Tag zu verzögern. Er sorgt lediglich dafür, dass unter mehreren gleich guten Verspätungsoptionen die frühere gewählt wird.
+
+Diese zwei Stufen (grosse, praktisch flache Grundstrafe + winziger Zeit-Tiebreaker) sind bewusst so gewählt, dass zwei Ziele gleichzeitig gelten: Erstens haben bereits überfällige Fahrzeuge (Deadline vor dem Start, siehe unten) KEINEN Vorrang mehr vor pünktlichen Fahrzeugen bei Kapazitätskonflikten - die Grundstrafe ist für jeden Verspätungstag praktisch gleich hoch, während pünktliche Arbeit mit jedem Tag Verzögerung linear teurer wird; bei einem Konflikt weicht deshalb das überfällige Fahrzeug aus, nicht das pünktliche. Zweitens werden überfällige Fahrzeuge untereinander trotzdem so früh wie möglich fertig, sobald Kapazität frei ist - dafür sorgt der winzige Zeit-Tiebreaker. Ein früherer Zwischenstand hatte hier eine quadratisch mit t wachsende Strafe (STRAFKOSTEN · t²), die das genaue Gegenteil bewirkte: überfällige Arbeit wurde bevorzugt vor pünktlicher eingeplant.
+
+Nebenbedingungen:
+
+Bedingung	Bedeutung
+Block_i_j	genau eine Blockvariante wird gewählt (Summe der u = 1); daraus folgt der gesamte Aufwand
+Menge_i_j_t	Mitarbeiter am Tag t (x oder z) = Menge der gewählten Variante an diesem Tag
+Kapazitaet_j_t	Summe über alle Fahrzeuge mit Aufwand in Abteilung j (x und z) ≤ Mitarbeiterzahl der Abteilung
+Exklusivitaet_i_t	Summe der Blockvarianten, die an Tag t an Fahrzeug i arbeiten, ≤ 1 — pro Tag arbeitet höchstens eine Abteilung an einem Fahrzeug
+
+Die Exklusivität ist der eigentliche Kern: ein Fahrzeug kann nicht gleichzeitig lackiert und verkabelt werden. Genau dafür braucht es die binären Variablen und damit ein MILP statt eines einfachen LP.
+
+Warum diese Formulierung: Die frühere Variante mit Ja/Nein-Variablen je Tag und Big-M-Kopplungen war zwar kürzer, aber mit der Regel „Fahrzeug fertig machen“ nicht mehr praktikabel lösbar (schon ab 10 Fahrzeugen keine Lösung in 40 s). Die Blockvarianten (zeitindizierte Formulierung) sind deutlich stärker; mit ihnen ließen sich zu Projektbeginn alle 44 (damals gefilterten) Fahrzeuge planen. Mit der heutigen, größeren Grundgesamtheit ist auch diese Formulierung bei sehr langen Zeithorizonten noch nicht immer im Zeitlimit lösbar (siehe „Laufzeit des Solvers“).
+
+Einschränkung: Innerhalb eines Blocks arbeiten an allen Tagen gleich viele Mitarbeiter, nur der letzte Tag bekommt den Rest. Ein Plan mit wechselnder Besetzung im Block (z. B. 1, 2, 1) wird nicht gesucht. Das kann den Plan minimal schlechter machen als ohne die Regel.
+
+Nachbearbeitung: Stellplatz-Verdichtung (verdichteLuecken in solver.js)
+Die Abteilungsblöcke eines Fahrzeugs (z. B. erst Aufbau, dann Lack) müssen im MILP selbst nicht zusammenhängen - dazwischen kann eine Lücke liegen, weil die dafür nötige Kapazität an den Tagen dazwischen durch andere Fahrzeuge belegt ist. In dieser Lücke steht das Fahrzeug unnötig auf dem Stellplatz, ohne dass daran gearbeitet wird.
+
+Ein Versuch, das direkt im MILP zu verhindern (je Fahrzeug zwei Hilfsvariablen für ersten/letzten Arbeitstag, gekoppelt über Big-M-Restriktionen, mit einer Strafe auf die Differenz in der Zielfunktion), hat sich als nicht praktikabel erwiesen: Es verdoppelt fast die Zeilenzahl des Modells und schwächt die LP-Relaxation so stark, dass HiGHS bei den echten Datenmengen selbst nach 120 s keine Lösung mehr fand (vorher: gelöst in 15-18 s) - unabhängig davon, wie klein die Strafe gewählt wurde. Das ist ein bekanntes Problem von Big-M-Formulierungen.
+
+Stattdessen läuft nach jedem Solve eine billige Nachbearbeitung (verdichteLuecken, Teil von loeseMitHighs, betrifft also sowohl highs-worker.js als auch test-solver.mjs): Für jedes Fahrzeug werden die Abteilungsblöcke ermittelt, und ab dem zweiten Block wird versucht, ihn so weit nach vorn zu schieben, dass er direkt an den vorherigen (ggf. schon verschobenen) Block anschließt - nur in Kapazität, die zu diesem Zeitpunkt tatsächlich frei ist, nie in Tage, die andere Fahrzeuge belegen. Der erste Block eines Fahrzeugs bleibt unangetastet: ihn ohne Rücksicht auf die folgenden Blöcke möglichst früh zu schieben, würde die Spanne eher vergrößern als verkleinern.
+
+Diese Nachbearbeitung kann eine Lücke nur verkleinern oder unverändert lassen, nie vergrößern, und ändert nichts an Aufwand, Kapazitätsauslastung oder Exklusivität - nur wann genau innerhalb der schon getroffenen Zuteilung gearbeitet wird. Sie kostet praktisch keine Zeit (wenige Millisekunden, egal wie groß das Modell), im Gegensatz zum MILP-Ansatz. In einem Testlauf mit echten Daten (Zeithorizont 14 Tage, 76 Fahrzeuge) sank die Summe der Lücken-Tage von 503 auf 479 bei 19 betroffenen Fahrzeugen - der Rest ist echte Kapazitätsknappheit, die auch diese Nachbearbeitung nicht auflösen kann, ohne andere Fahrzeuge zu verdrängen.
+
+Ausgabe
+Nach dem Laden der Daten steht als Erstes „Planungshorizont T = … Werktage (Tag 1 = …, Tag T = …)“, danach zwei Darstellungen derselben Lösung: eine Tagesliste im <pre id="output"> und ein Gantt-Diagramm als CSS-Grid (renderGantt) — eine Zeile pro Fahrzeug, eine Spalte pro Tag, Farbe = Abteilung, roter Rahmen = Deadline-Tag, rot schraffiert = Arbeit nach der Deadline. Bei vielen Tagen scrollt das Gantt seitlich; die Fahrgestellnummer/Status-Spalte am Zeilenanfang und die Ecke der Kopfzeile bleiben dabei fixiert stehen (position: sticky, Klasse gantt-fix in style.css), sodass sie beim Scrollen sichtbar bleiben. Die Tage sind mit Datum beschriftet (5-Tage-Woche, Samstag und Sonntag werden übersprungen): im Gantt-Kopf steht unter „T1“ das Datum, in der Tagesliste „--- Tag 1 (Mo., 21.09.2026) ---“. Tag 1 ist der erste Werktag ab dem Berechnungsdatum.
+
+Fahrzeugbeschriftung: Am Zeilenanfang steht die Fahrzeugnummer, dahinter der aktuelle AUF_STATUS (z. B. „13XW188 nicht angeliefert“). Fahrzeuge mit Auftragsart ZAP (AUF_AUFTRAGSART) sind blau eingefärbt (Klasse .zap). Fährt man mit der Maus über die Beschriftung, zeigt ein Tooltip Leistungsumfang (AUF_LEIST_UMF), Anlieferung (AUF_DAT_ANLIEF_AKT bzw. „bereits angeliefert“), Gesamtstunden (Summe der Reststunden aller Abteilungen, entspricht AUF_STD_REST_GES) und die ursprünglich geplanten Stunden (AUF_STD_PLAN_GES); nur bei Excel-Daten.
+
+Filter: Über dem Gantt gibt es je Abteilung einen Button (in der Farbe der Abteilung) plus „Alle“. Ein Klick schaltet die Abteilung im Gantt ein oder aus; ausgeblendete Abteilungen erscheinen nicht mehr, und Fahrzeuge ohne Arbeit in den angezeigten Abteilungen entfallen als Zeile („3 von 44 Fahrzeugen“). Ist keine Abteilung aktiv, erscheint „Keine Abteilung ausgewählt.“. Alle Tooltips (Fahrzeugbeschriftung, Abteilungs-Buttons, Legende, Tageskopf, Zellen) sind ein eigener Tooltip (data-tip, initTooltip in solver.js) statt des eingebauten title-Attributs, weil dieses z. B. im Simple Browser von VS Code nicht angezeigt wird. Der Filter wirkt nur auf das Gantt-Diagramm, nicht auf die Tagesliste; er wird nicht neu berechnet, sondern zeichnet nur die letzte Lösung neu (zeichneGantt, zeichneFilter in solver.js). Unter „=== DEADLINES ===" steht je Fahrzeug, an welchem Tag es fertig wird und wie viele Tage es zu spät ist.
+
+Auslastung pro Woche
+Unter dem Gantt zeigt eine Tabelle die Auslastung je Abteilung und Kalenderwoche in Prozent (plus Zeile „Gesamt“ über alle Abteilungen). Spalten sind die Wochen Mo-Fr mit KW-Nummer und Datum, ein Balken im Hintergrund der Zelle zeigt den Wert. Berechnung (berechneAuslastung in solver.js):
+
+Auslastung = eingesetzte Mitarbeiter-Tage / (Mitarbeiter pro Tag der Abteilung · Werktage der Woche)
+
+Eingesetzt sind alle Mitarbeiter über alle Fahrzeuge (x und z). Ist die erste oder letzte Woche des Planungszeitraums angebrochen, zählen nur die Werktage, die im Zeitraum liegen (z. B. 2 statt 5 Tage). „Gesamt“ ist die Summe der eingesetzten Mitarbeiter-Tage geteilt durch die Summe der Kapazitäten aller Abteilungen. Der Abteilungsfilter beeinflusst die Tabelle nicht. Zusätzlich steht die Gesamtauslastung direkt auf den Abteilungs-Buttons über dem Gantt („Lack Auslastung 10 %“), und der Tooltip (Maus über den Button oder über den Namen in der Legende) zeigt die Auslastung dieser Abteilung: zuerst „Auslastung gesamt“ über den ganzen Zeitraum (nach Werktagen gewichtet), darunter je Kalenderwoche („KW 39: 100 %“). Beispiel: bei 2 Mitarbeitern Kapazität und 3 eingesetzten Mitarbeiter-Tagen in einer 5-Tage-Woche sind es 3 / 10 = 30 %. Die Summe aller Werte ergibt wieder den Gesamtaufwand (Plausibilitätsprüfung möglich, der genaue Wert hängt vom gewählten Zeithorizont und damit der Fahrzeugauswahl ab).
+
+Hinweis zur Aussage: Die Auslastung bezieht sich auf die Kapazität, die im Eingabefeld steht. Liegt sie hoch, kann eine Abteilung wenig ausgelastet wirken, obwohl der Plan optimal ist; liegt sie niedrig, sind die Wochen bis zum Rand voll (100 %).
+
+Datenfluss
+solver.js ruft /api/planung auf (Fahrzeuge.js). Dort gibt es drei Quellen, in dieser Reihenfolge:
+
+1. Oracle-Tabelle fahrzeugplanung (Fahrzeuge.js -> db.js). Aufwand, Deadline und Kapazität kommen aus der Tabelle. Berechnungsdatum und Zeithorizont wirken hier nicht, das sind reine Excel-Fallback-Parameter.
+2. Excel-Datei A_Auftragsübersicht_Lokal.xlsx, wenn die DB nicht erreichbar ist (z. B. DB_CONNECT nicht aufgelöst). Fahrzeuge.js (excelToModel) und excel.js.
+3. Demo-Daten (DEMO_DATEN in solver.js), wenn auch die Excel-Datei nicht lesbar ist.
+
+Die Optimierung selbst läuft unabhängig von der Quelle. Angezeigt wird je Fahrzeug die Fahrzeugnummer (AUF_FZGNR), bei DB- und Demo-Daten die ID; intern rechnet der Solver mit der eindeutigen Auftrags-ID.
+
+Laufzeit des Solvers
+Zu Projektbeginn (44 Fahrzeuge, Werk Wittlich, nur angeliefert, mit Deadline und Aufwand, T ≈ 34) fand der damals verwendete GLPK-Solver je nach Kapazität nach wenigen Sekunden bis ca. 120 s eine gute bzw. optimale Lösung.
+
+Die Grundgesamtheit ist seitdem umgestellt: Es zählt jetzt jedes Wittlich-Fahrzeug, dessen Status nicht „ausgeliefert“ oder „storniert“ ist und das im gewählten Zeithorizont angeliefert wird oder bereits da ist (siehe „Excel-Fallback im Detail“). Je nach Zeithorizont sind das in den Testdaten grob 45 bis über 140 Fahrzeuge, mit einem Planungshorizont T von 35 bis über 200 Werktagen. Mit dieser Größe (mehrere zehntausend bis über hunderttausend Modellvariablen, ein erheblicher Teil davon binär) kam GLPK an seine Grenzen und fand oft innerhalb des Zeitlimits keine zulässige Lösung mehr. Der Solver wurde deshalb auf HiGHS umgestellt (ebenfalls Open Source und als WebAssembly verfügbar, aber bei LP/MIP deutlich leistungsfähiger).
+
+Eigene Messungen außerhalb des Browsers (Node, Kapazität 3 je Abteilung, Start 21.09.2026, 45 s Zeitlimit) zeigen die Verbesserung:
+
+Zeithorizont	Fahrzeuge	T	Ergebnis mit HiGHS
+0 Tage	46	38	nach 45 s zulässig, nicht optimal bewiesen
+7 Tage	56	47	optimal bewiesen nach ca. 25 s
+14 Tage	76	80	nach 45 s zulässig, nicht optimal bewiesen
+30 Tage	89	129	nach 45 s zulässig, nicht optimal bewiesen
+180 Tage	118	227	auch nach 120 s keine zulässige Lösung
+
+Bei denselben Zeithorizonten hatte GLPK zuvor durchgehend keine Lösung gefunden (außer bei sehr kleinen Modellen). HiGHS findet also bei Zeithorizonten bis etwa 30 Tage inzwischen zuverlässig einen gültigen (wenn auch nicht immer bewiesen optimalen) Plan. Bei sehr großen Modellen (Zeithorizont 180 Tage, T > 200) reicht aber auch mit HiGHS ein Zeitlimit von 120 s nicht sicher aus.
+
+Ein Plan gilt als gültig, wenn HiGHS eine zulässige Lösung liefert (Status „Optimal“ oder Zeitlimit erreicht, aber mit gefundener Lösung); wird in der Zeit gar keine Lösung gefunden, erscheint ein entsprechender Hinweis, dann helfen ein kürzerer Zeithorizont, weniger Fahrzeuge, eine höhere Kapazität oder ein größeres Zeitlimit.
+
+Abbrechen: Während der Berechnung ist neben „Optimierung starten“ der Button „Abbrechen“ aktiv. Er bricht das Laden der Daten (fetch) und den Solver (Web Worker highs-worker.js, worker.terminate()) ab und gibt „Abgebrochen.“ aus. Ohne Abbrechen wird die Seite nicht blockiert, der Solver läuft im Hintergrund. Solange geladen bzw. gerechnet wird, dreht sich neben den Buttons ein Spinner mit der verstrichenen Zeit („läuft … 12 s“); beides verschwindet, sobald das Ergebnis da ist, bei Abbruch oder Fehler.
+
+Excel-Fallback im Detail
+- Grundgesamtheit: Werk Wittlich (AUF_TMC_WERK) und Status weder „ausgeliefert“ noch „storniert“ (AUF_STATUS) — sonst kein weiterer Statusfilter.
+- Zeithorizont (Auswahl der Fahrzeuge, die tatsächlich geplant werden): ein Fahrzeug kommt in die Planung, wenn es entweder bereits angeliefert ist (AUF_DAT_ANLIEF_IST gefüllt) oder seine geplante Anlieferung (AUF_DAT_ANLIEF_AKT) zwischen dem Berechnungsdatum und dem Ende des Zeithorizonts liegt (Berechnungsdatum + Zeithorizont in Kalendertagen, Standard 180). Eine überfällige geplante Anlieferung (vor dem Berechnungsdatum, ohne AUF_DAT_ANLIEF_IST) oder ein fehlendes Anlieferdatum zählt nicht. Fahrzeuge ohne Aufwand in irgendeiner Abteilung fallen ebenfalls heraus. Die Datenzeile in der Ausgabe zeigt „x von y Fahrzeuge“ (x = geplant, y = gesamte Grundgesamtheit vor dem Zeithorizont-Filter).
+- Anlieferungssperre: Bereits angelieferte Fahrzeuge sind ab Tag 1 bearbeitbar; sonst ab dem (auf den nächsten Werktag gerundeten) Tag der geplanten Anlieferung. Vor diesem Tag plant der Solver keine Arbeit ein (siehe „Das Modell in solver.js“).
+- Aufwand: AUF_STD_<Abteilung>_REST (Aufbau, Fgest, FHS, Lack, Elektrik) in Stunden, geteilt durch 7 Stunden pro Tag (STUNDEN_PRO_TAG) und aufgerundet auf ganze Mitarbeiter-Tage. Abteilungen, die in keinem der ausgewählten Fahrzeuge vorkommen, entfallen.
+- Deadline: WERKLIEF als Werktag (Mo-Fr) ab dem Berechnungsdatum. Fehlt WERKLIEF, hat das Fahrzeug zunächst keine Deadline und bekommt am Ende das Ende des Planungshorizonts T zugewiesen (kein künstlicher Verzug). Liegt WERKLIEF vor dem Berechnungsdatum (überfällig), ist die Deadline 0 — die gesamte Arbeit gilt dann als verspätet.
+- Kapazität: In index.html gibt es je Abteilung ein Eingabefeld „Mitarbeiter pro Tag“ (Aufbau, Fgest, FHS, Lack, Elektrik; Standard 3). Die Werte gehen als ?kap_<Abteilung>=N an die API. Sie gelten nur für die Excel-Daten; die DB liefert eigene Werte je Abteilung.
+- Max. Mitarbeiter pro Fahrzeug und Abteilung: Feld in index.html (Standard 2), als ?max_fzg=N an die API. Der Planungshorizont berücksichtigt die Grenze, weil ein Fahrzeug bei weniger Mitarbeitern pro Tag länger in einer Abteilung bleibt.
+- Berechnungsdatum: Feld in index.html (Standard: heutiges Datum, wird beim Laden der Seite vorbelegt), als ?start=JJJJ-MM-TT an die API. Tag 1 des Plans ist der erste Werktag ab diesem Datum; damit lässt sich für unterschiedliche Starttage am selben Tag rechnen.
+- Zeithorizont für Fahrzeuge: Feld in index.html (Standard 180), als ?horizont=N (Kalendertage) an die API. Siehe „Grundgesamtheit“ oben.
+- Laufzeit bis der Solver abbricht: Feld in index.html (Standard 120 Sekunden). Wirkt als Zeitlimit für HiGHS (time_limit, gesetzt in loeseMitHighs in solver.js); anders als früher keine feste Konstante mehr im Code.
+- Lieferprio: Schaltfläche „Lieferprio berücksichtigen“ in index.html (Standard aus), als ?liefprio=1 an die API. Liest die Spalte Lieferprio aus der Excel (1 = Liefertermin muss unter allen Umständen erreicht werden, größere Zahl = niedrigere Priorität; leer = keine besondere Priorität). Wichtig: Stand 25.09.2026 hat diese Spalte bei allen 19.175 Zeilen der Datei denselben Wert (4) - technisch gelesen, aber noch keine echte Differenzierung zwischen Fahrzeugen; die Funktion greift erst spürbar, sobald sich die Werte unterscheiden. Wirkung im Modell (baueModell in solver.js): Ist die Schaltfläche aus, verhält sich das Modell exakt wie ohne diese Funktion. Ist sie an, wird die Verspätungsstrafe (STRAFKOSTEN) für Fahrzeuge mit gesetzter Prio mit PRIO_FAKTOR/prio hochskaliert (PRIO_FAKTOR = 1000: Prio 1 -> 1000-fache Strafe, Prio 2 -> 500-fache, usw.) - eine echte harte Grenze ("unter allen Umständen") wäre im MILP riskant (könnte das Modell unlösbar machen, wenn die Deadline physisch nicht zu halten ist), die stark hochskalierte Strafe kommt dem aber so nahe wie praktikabel: bei einem Kapazitätskonflikt weicht immer das nicht- oder niedriger-priorisierte Fahrzeug aus. Getestet mit einem konstruierten Beispiel (zwei sonst gleiche Fahrzeuge, ein Kapazitätsslot, eines mit Prio 1 und leichtem Startnachteil): ohne die Schaltfläche wird das Prio-1-Fahrzeug 3 Tage zu spät fertig, mit eingeschalteter Schaltfläche nur 1 Tag zu spät (das physische Minimum, weil es selbst erst 1 Tag später verfügbar ist) - das andere Fahrzeug weicht dafür entsprechend weiter aus.
+- Planungshorizont T: die späteste Deadline der ausgewählten Fahrzeuge, mindestens aber so lang, dass die Arbeit möglich ist (Kapazitätsgrenze je Abteilung und die nacheinander laufenden Abteilungen je Fahrzeug, jeweils ab dem frühesten Anlieferungstag) — sonst wäre das Modell unlösbar. T hat kein festes Maximum mehr; er ergibt sich allein aus der (über den Zeithorizont eingeschränkten) Fahrzeugauswahl.
+- Cache: Die xlsx (ca. 120 MB XML) wird nur einmal gestreamt (ca. 30 s) und als daten/auftraege.json gespeichert (in .gitignore). Danach wird nur noch die JSON gelesen; sie wird neu erzeugt, wenn die xlsx neuer ist oder sich der Aufbau geändert hat (CACHE_VERSION in excel.js).
+
+Zu beachten
+Die Fahrzeugzahl und damit T hängen stark vom gewählten Zeithorizont ab (grob 45 Fahrzeuge bei 0 Tagen bis über 140 bei 180 Tagen, Stand der Testdaten). Mit HiGHS findet der Solver bei Zeithorizonten bis etwa 30 Tage im Standard-Zeitlimit zuverlässig einen gültigen Plan; beim Standardwert von 180 Tagen (T über 200 Werktage) reicht auch ein deutlich höheres Zeitlimit oft nicht (siehe „Laufzeit des Solvers“). Für einen in angemessener Zeit belastbaren Plan hilft es, den Zeithorizont klein zu halten (z. B. 7–30 Tage) und/oder die Laufzeit bis zum Abbruch hochzusetzen.

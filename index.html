@@ -3,11 +3,55 @@
 <head>
     <meta charset="UTF-8">
     <title>Fahrzeugoptimierung</title>
+    <link rel="icon" type="image/svg+xml" href="favicon-lkw.svg">
+    <link rel="alternate icon" href="favicon-lkw.ico">
+
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <h1>Fahrzeugoptimierung</h1>
-    <button onclick="runSolver()">Optimierung starten</button>
+    <h1>Fahrzeugoptimierung der Einplanung im TMC Wittlich</h1>
+    <fieldset class="eingabe">
+        <legend>Mitarbeiter pro Tag</legend>
+        <label>Aufbau <input type="number" class="kapazitaet" data-abteilung="Aufbau" min="1" step="1" value="3"></label>
+        <label>Fgest <input type="number" class="kapazitaet" data-abteilung="Fgest" min="1" step="1" value="3"></label>
+        <label>FHS <input type="number" class="kapazitaet" data-abteilung="FHS" min="1" step="1" value="3"></label>
+        <label>Lack <input type="number" class="kapazitaet" data-abteilung="Lack" min="1" step="1" value="3"></label>
+        <label>Elektrik <input type="number" class="kapazitaet" data-abteilung="Elektrik" min="1" step="1" value="3"></label>
+    </fieldset>
+    <label class="eingabe">
+        Max. Mitarbeiter pro Fahrzeug und Abteilung:
+        <input type="number" id="maxFzg" min="1" step="1" value="2">
+    </label>
+    <label class="eingabe">
+        Berechnungsdatum (Tag 1 des Plans):
+        <input type="date" id="berechnungsdatum">
+    </label>
+    <label class="eingabe">
+        Zeithorizont für Fahrzeuge (Anlieferung in den nächsten Tagen):
+        <input type="number" id="zeithorizont" min="1" step="1" value="180">
+    </label>
+    <label class="eingabe">
+        Laufzeit bis der Solver abbricht (Sekunden):
+        <input type="number" id="zeitlimit" min="1" step="1" value="120">
+    </label>
+    <label class="eingabe schalter">
+        <input type="checkbox" id="liefprio">
+        Lieferprio berücksichtigen (1 = Liefertermin unbedingt halten)
+    </label>
+    <button id="btn-start" onclick="runSolver()">Optimierung starten</button>
+    <button id="btn-abbrechen" class="abbrechen" onclick="abbrechen()" disabled>Abbrechen</button>
+    <span id="spinner" class="spinner" hidden role="status" aria-label="Berechnung läuft"></span>
+    <span id="laufzeit" class="laufzeit"></span>
+
     <pre id="output"></pre>
+
+    <div id="gantt-wrapper">
+        <div id="gantt-filter"></div>
+        <div id="gantt"></div>
+        <div id="gantt-legend"></div>
+    </div>
+
+    <div id="auslastung"></div>
 
     <!-- WICHTIG: type="module", damit import in solver.js funktioniert -->
     <script type="module" src="solver.js"></script>

@@ -1,0 +1,5 @@
+.env
+node_modules/
+daten/
+A_Auftragsübersicht_Lokal.xlsx
+A_Auftragsübersicht_Lokal_Backup.xlsx
