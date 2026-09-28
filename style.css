@@ -17,6 +17,33 @@ button:disabled {
     opacity: 0.45;
     cursor: not-allowed;
 }
+.tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 2px solid #ccc;
+    margin: 20px 0 12px;
+}
+.tab-btn {
+    padding: 8px 18px;
+    font-size: 14px;
+    background: #eef1f4;
+    color: #333;
+    border-radius: 6px 6px 0 0;
+    margin-bottom: -2px;
+}
+.tab-btn:hover {
+    background: #dfe4e9;
+}
+.tab-btn.aktiv {
+    background: #003A70;
+    color: #fff;
+}
+.tab-panel {
+    display: none;
+}
+.tab-panel.aktiv {
+    display: block;
+}
 #tooltip {
     position: fixed;
     z-index: 1000;
@@ -163,6 +190,36 @@ table.auslastung tr.gesamt th, table.auslastung tr.gesamt td {
 .eingabe.schalter {
     align-items: center;
     padding: 8px 12px;
+}
+.eingabe.abwesenheiten {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 8px 12px;
+}
+#abwesenheiten-liste:empty {
+    display: none;
+}
+.abwesenheit-zeile {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+}
+.abwesenheit-zeile select,
+.abwesenheit-zeile input[type="date"] {
+    padding: 4px;
+}
+.abwesenheit-zeile input[type="number"] {
+    width: 50px;
+    padding: 4px;
+}
+.abwesenheit-zeile button {
+    padding: 2px 8px;
+    font-size: 12px;
+}
+#btn-abwesenheit-hinzu {
+    align-self: flex-start;
 }
 .fzg-label {
     font-size: 12px;

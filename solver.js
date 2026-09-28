@@ -68,6 +68,35 @@ function initBerechnungsdatum() {
 
 initBerechnungsdatum();
 
+// Register (Tabs): Klick auf einen Tab-Button blendet das zugehoerige .tab-panel ein und alle
+// anderen (innerhalb derselben .tab-gruppe) aus. Pro .tab-gruppe eigenstaendig, damit mehrere
+// unabhaengige Tab-Gruppen auf der Seite moeglich sind. Der zuletzt aktive Tab je Gruppe wird
+// in localStorage gemerkt, damit er einen Seiten-Reload uebersteht.
+function zeigeTab(gruppe, name) {
+    gruppe.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('aktiv', btn.dataset.tab === name));
+    gruppe.querySelectorAll('.tab-panel').forEach(panel => panel.classList.toggle('aktiv', panel.id === `tab-${name}`));
+}
+
+function initTabs() {
+    if (typeof document === 'undefined') return;
+    document.querySelectorAll('.tab-gruppe').forEach(gruppe => {
+        const buttons = [...gruppe.querySelectorAll('.tab-btn')];
+        if (!buttons.length) return;
+        const key = `aktiverTab_${gruppe.dataset.gruppe || ''}`;
+
+        buttons.forEach(btn => btn.addEventListener('click', () => {
+            zeigeTab(gruppe, btn.dataset.tab);
+            try { localStorage.setItem(key, btn.dataset.tab); } catch { /* z. B. privates Fenster */ }
+        }));
+
+        let gemerkt = null;
+        try { gemerkt = localStorage.getItem(key); } catch { /* z. B. privates Fenster */ }
+        if (gemerkt && buttons.some(btn => btn.dataset.tab === gemerkt)) zeigeTab(gruppe, gemerkt);
+    });
+}
+
+initTabs();
+
 // Geleistete Mitarbeiter-Tage: planmaessig (x) oder verspaetet (z).
 // Fuer einen Tag ist immer nur eine der beiden Variablen vorhanden.
 function arbeitsmenge(sol, i, j, t) {
@@ -325,6 +354,12 @@ function zeichneLegende() {
     verzugNote.innerHTML = '<span style="width:10px;height:10px;border-radius:2px;display:inline-block;'
         + 'background:repeating-linear-gradient(45deg,#888,#888 3px,#cc0000 3px,#cc0000 6px)"></span>nach Deadline';
     legend.appendChild(verzugNote);
+
+    const zapNote = document.createElement('span');
+    zapNote.style.cssText = 'display:flex;align-items:center;gap:6px';
+    zapNote.innerHTML = '<span style="width:10px;height:10px;border-radius:2px;background:#0b5ed7;display:inline-block"></span>'
+        + '<span class="zap">Fahrgestellnummer</span> = ZAP-Auftrag';
+    legend.appendChild(zapNote);
 }
 
 // ============================
@@ -348,7 +383,10 @@ function montagDerWoche(d) {
 // Auslastung je Abteilung und Kalenderwoche in Prozent:
 // eingesetzte Mitarbeiter-Tage / (Mitarbeiter pro Tag * Werktage der Woche im Planungszeitraum).
 // Angebrochene Wochen am Rand zaehlen nur mit den Tagen, die im Planungszeitraum liegen.
-export function berechneAuslastung(sol, fahrzeuge, abteilungen, T, kapazitaet, startIso) {
+export function berechneAuslastung(sol, fahrzeuge, abteilungen, T, kapazitaet, startIso, kapAbzug = {}) {
+    // Tageskapazitaet abzueglich Abwesenheiten (Urlaub/Krank, siehe baueModell) - nie unter 0
+    const kapTag = (j, t) => Math.max(0, kapazitaet[j] - (kapAbzug[j]?.[t] || 0));
+
     const wochen = []; // { montag, tage: [t, ...] }
 
     for (let t = 1; t <= T; t++) {
@@ -367,15 +405,16 @@ export function berechneAuslastung(sol, fahrzeuge, abteilungen, T, kapazitaet, s
         prozent: wochen.map(w => {
             const genutzt = w.tage.reduce((sum, t) =>
                 sum + fahrzeuge.reduce((s, i) => s + arbeitsmenge(sol, i, j, t), 0), 0);
-            return 100 * genutzt / (kapazitaet[j] * w.tage.length);
+            const kapWoche = w.tage.reduce((s, t) => s + kapTag(j, t), 0);
+            return kapWoche > 0 ? 100 * genutzt / kapWoche : 0;
         })
     }));
 
-    const summeKap = abteilungen.reduce((s, j) => s + kapazitaet[j], 0);
     const gesamt = wochen.map((w, k) => {
         const genutzt = zeilen.reduce((s, z, idx) =>
-            s + z.prozent[k] / 100 * kapazitaet[abteilungen[idx]] * w.tage.length, 0);
-        return 100 * genutzt / (summeKap * w.tage.length);
+            s + z.prozent[k] / 100 * w.tage.reduce((sum, t) => sum + kapTag(abteilungen[idx], t), 0), 0);
+        const kapWoche = abteilungen.reduce((s, j) => s + w.tage.reduce((sum, t) => sum + kapTag(j, t), 0), 0);
+        return kapWoche > 0 ? 100 * genutzt / kapWoche : 0;
     });
 
     return { wochen, zeilen, gesamt };
@@ -481,6 +520,101 @@ function zeithorizontTage() {
     return Number.parseInt(document.getElementById('zeithorizont')?.value, 10) || 180;
 }
 
+// Abwesenheiten (Urlaub/Krank): Liste von { abteilung, von, bis, anzahl }, die die Mitarbeiter
+// pro Tag der jeweiligen Abteilung fuer den Zeitraum reduzieren (siehe kapTag() in baueModell).
+// Im Browser in localStorage gemerkt, damit die Eingabe einen Seiten-Reload uebersteht - rein
+// browserseitige Bequemlichkeit, geht nirgendwo sonst hin.
+const ABWESENHEITEN_KEY = 'abwesenheiten';
+let abwesenheiten = [];
+
+function ladeAbwesenheiten() {
+    try {
+        const liste = JSON.parse(localStorage.getItem(ABWESENHEITEN_KEY) || '[]');
+        return Array.isArray(liste) ? liste : [];
+    } catch {
+        return [];
+    }
+}
+
+function speichereAbwesenheiten() {
+    try { localStorage.setItem(ABWESENHEITEN_KEY, JSON.stringify(abwesenheiten)); } catch { /* z. B. privates Fenster */ }
+}
+
+// Abteilungen aus den vorhandenen "Mitarbeiter pro Tag"-Feldern (data-abteilung), damit die
+// Auswahl automatisch zu den echten Abteilungen passt.
+function bekannteAbteilungen() {
+    return [...document.querySelectorAll('input.kapazitaet')].map(el => el.dataset.abteilung);
+}
+
+function zeichneAbwesenheiten() {
+    const box = document.getElementById('abwesenheiten-liste');
+    if (!box) return;
+    box.innerHTML = '';
+
+    abwesenheiten.forEach((a, idx) => {
+        const zeile = document.createElement('div');
+        zeile.className = 'abwesenheit-zeile';
+
+        const abteilung = document.createElement('select');
+        bekannteAbteilungen().forEach(j => {
+            const opt = document.createElement('option');
+            opt.value = j;
+            opt.textContent = j;
+            if (j === a.abteilung) opt.selected = true;
+            abteilung.appendChild(opt);
+        });
+        if (!a.abteilung) a.abteilung = abteilung.value;
+        abteilung.onchange = () => { a.abteilung = abteilung.value; speichereAbwesenheiten(); };
+
+        const von = document.createElement('input');
+        von.type = 'date';
+        von.value = a.von || '';
+        von.setAttribute('aria-label', 'Abwesend von');
+        von.onchange = () => { a.von = von.value; speichereAbwesenheiten(); };
+
+        const bis = document.createElement('input');
+        bis.type = 'date';
+        bis.value = a.bis || '';
+        bis.setAttribute('aria-label', 'Abwesend bis');
+        bis.onchange = () => { a.bis = bis.value; speichereAbwesenheiten(); };
+
+        const anzahl = document.createElement('input');
+        anzahl.type = 'number';
+        anzahl.min = '1';
+        anzahl.step = '1';
+        anzahl.value = a.anzahl ?? 1;
+        anzahl.setAttribute('aria-label', 'Anzahl abwesender Mitarbeiter');
+        anzahl.onchange = () => { a.anzahl = Number.parseInt(anzahl.value, 10) || 1; speichereAbwesenheiten(); };
+
+        const entfernen = document.createElement('button');
+        entfernen.type = 'button';
+        entfernen.className = 'abbrechen';
+        entfernen.textContent = '✕';
+        entfernen.title = 'Abwesenheit entfernen';
+        entfernen.onclick = () => {
+            abwesenheiten.splice(idx, 1);
+            speichereAbwesenheiten();
+            zeichneAbwesenheiten();
+        };
+
+        zeile.append(abteilung, ' vom ', von, ' bis ', bis, ' Anzahl ', anzahl, entfernen);
+        box.appendChild(zeile);
+    });
+}
+
+// Guard wie bei initTooltip()/initBerechnungsdatum(): dieses Modul wird auch ohne document
+// importiert (highs-worker.js fuer den Solve, test-solver.mjs fuer die Tests).
+if (typeof document !== 'undefined') {
+    document.getElementById('btn-abwesenheit-hinzu')?.addEventListener('click', () => {
+        abwesenheiten.push({ abteilung: bekannteAbteilungen()[0], von: '', bis: '', anzahl: 1 });
+        speichereAbwesenheiten();
+        zeichneAbwesenheiten();
+    });
+
+    abwesenheiten = ladeAbwesenheiten();
+    zeichneAbwesenheiten();
+}
+
 // Laufender Durchgang (null, wenn nichts laeuft). abbrechen() beendet das Laden der
 // Daten (fetch) und den Solver (Web Worker highs-worker.js).
 class AbbruchFehler extends Error {}
@@ -532,6 +666,8 @@ async function ladePlanungsdaten() {
         params.set('max_fzg', maxProFahrzeug());
         params.set('horizont', zeithorizontTage());
         if (document.getElementById('liefprio')?.checked) params.set('liefprio', '1');
+        const gueltigeAbwesenheiten = abwesenheiten.filter(a => a.abteilung && a.von && a.bis && a.anzahl > 0);
+        if (gueltigeAbwesenheiten.length) params.set('abwesenheiten', JSON.stringify(gueltigeAbwesenheiten));
         const datum = document.getElementById('berechnungsdatum')?.value;
         if (datum) params.set('start', datum);
         const res = await fetch(`/api/planung?${params}`, { signal: lauf?.controller.signal });
@@ -560,6 +696,10 @@ async function ladePlanungsdaten() {
         print(`Daten aus ${daten.quelle ?? 'DB'} geladen: ${daten.fahrzeuge.length}${daten.anzahlAuftraege ? ` von ${daten.anzahlAuftraege}` : ''} Fahrzeuge, ${daten.abteilungen.length} Abteilungen, ${daten.T} Tage\n`);
         if (daten.liefprioAktiv) {
             print(`Lieferprio berücksichtigt: ${mitPrio} von ${daten.fahrzeuge.length} Fahrzeugen haben eine gesetzte Lieferprio.\n`);
+        }
+        const abteilungenMitAbzug = daten.kapAbzug ? Object.keys(daten.kapAbzug) : [];
+        if (abteilungenMitAbzug.length) {
+            print(`Abwesenheiten berücksichtigt: reduzierte Kapazität in ${abteilungenMitAbzug.join(', ')}.\n`);
         }
         return daten;
     } catch (err) {
@@ -600,10 +740,13 @@ export function baueModell(daten) {
         maxProFahrzeug = Infinity, // max. Mitarbeiter je Fahrzeug und Abteilung pro Tag
         verfuegbarAb = {}, // Fahrzeug -> erster Tag, an dem es bearbeitet werden darf (Anlieferung); Standard 1
         prio = {}, // Fahrzeug -> Lieferprio (Spalte "Lieferprio"), nur gesetzt wenn vorhanden; 1 = hoechste Prioritaet
-        liefprioAktiv = false // Schaltflaeche "Lieferprio beruecksichtigen" in der GUI
+        liefprioAktiv = false, // Schaltflaeche "Lieferprio beruecksichtigen" in der GUI
+        kapAbzug = {} // Abteilung -> Tag -> Mitarbeiter, die an dem Tag abwesend sind (Urlaub/Krank)
     } = daten;
 
     const ab = i => verfuegbarAb[i] ?? 1;
+    // Tageskapazitaet abzueglich Abwesenheiten - nie unter 0
+    const kapTag = (j, t) => Math.max(0, kapazitaet[j] - (kapAbzug[j]?.[t] || 0));
 
     // Mitarbeiter je Tag: bis zur Deadline x, danach z (nur eine der beiden existiert)
     const tagesVar = (i, j, t) => `${t <= deadline[i] ? 'x' : 'z'}_${i}_${j}_t${t}`;
@@ -724,7 +867,7 @@ export function baueModell(daten) {
         }
     }
 
-    // Kapazitaet: Summe ueber alle Fahrzeuge je Abteilung und Tag
+    // Kapazitaet: Summe ueber alle Fahrzeuge je Abteilung und Tag (abzueglich Abwesenheiten)
     for (const j of abteilungen) {
         const mitAufwand = fahrzeuge.filter(i => aufwand[`${i}_${j}`] > 0);
         if (!mitAufwand.length) continue;
@@ -732,7 +875,7 @@ export function baueModell(daten) {
             constraints.push({
                 name: `Kapazitaet_${j}_t${t}`,
                 vars: mitAufwand.map(i => ({ name: tagesVar(i, j, t), coef: 1 })),
-                bnds: { type: UP, ub: kapazitaet[j] }
+                bnds: { type: UP, ub: kapTag(j, t) }
             });
         }
     }
@@ -1046,7 +1189,7 @@ async function solveOptimization() {
     }
 
     // Gantt-Diagramm zeichnen
-    const auslastung = berechneAuslastung(sol, fahrzeuge, abteilungen, T, daten.kapazitaet, startIso);
+    const auslastung = berechneAuslastung(sol, fahrzeuge, abteilungen, T, daten.kapazitaet, startIso, daten.kapAbzug);
     renderGantt(sol, fahrzeuge, abteilungen, T, deadline, bezeichnung, startIso, auslastung, i => fahrzeugInfo(daten, i));
     renderAuslastung(auslastung);
 
@@ -1067,6 +1210,9 @@ async function runSolver() {
     if (auslastung) auslastung.innerHTML = "";
     plan = null;
     if (lauf) return; // laeuft schon
+    // Live-Ausgabe ist immer auf dem Tagesliste-Tab zu sehen, auch wenn zuletzt Gantt/Auslastung aktiv war
+    const ausgabeGruppe = document.querySelector('.tab-gruppe[data-gruppe="ausgabe"]');
+    if (ausgabeGruppe) zeigeTab(ausgabeGruppe, 'tagesliste');
     lauf = { abgebrochen: false, controller: new AbortController(), worker: null, beendeSolve: null };
     setzeLaufZustand(true);
     print("Starte Optimierung...\n");

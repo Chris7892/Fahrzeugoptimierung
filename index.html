@@ -32,26 +32,45 @@
     </label>
     <label class="eingabe">
         Laufzeit bis der Solver abbricht (Sekunden):
-        <input type="number" id="zeitlimit" min="1" step="1" value="120">
+        <input type="number" id="zeitlimit" min="1" step="1" value="240">
     </label>
     <label class="eingabe schalter">
         <input type="checkbox" id="liefprio">
         Lieferprio berücksichtigen (1 = Liefertermin unbedingt halten)
     </label>
+    <fieldset class="eingabe abwesenheiten">
+        <legend>Abwesenheiten (Urlaub/Krank) — reduzieren die Mitarbeiter pro Tag der jeweiligen Abteilung</legend>
+        <div id="abwesenheiten-liste"></div>
+        <button type="button" id="btn-abwesenheit-hinzu">+ Abwesenheit hinzufügen</button>
+    </fieldset>
     <button id="btn-start" onclick="runSolver()">Optimierung starten</button>
     <button id="btn-abbrechen" class="abbrechen" onclick="abbrechen()" disabled>Abbrechen</button>
     <span id="spinner" class="spinner" hidden role="status" aria-label="Berechnung läuft"></span>
     <span id="laufzeit" class="laufzeit"></span>
 
-    <pre id="output"></pre>
+    <div class="tab-gruppe" data-gruppe="ausgabe">
+        <div class="tabs" role="tablist">
+            <button type="button" class="tab-btn aktiv" role="tab" data-tab="tagesliste">Tagesliste</button>
+            <button type="button" class="tab-btn" role="tab" data-tab="gantt">Gantt-Diagramm</button>
+            <button type="button" class="tab-btn" role="tab" data-tab="auslastung">Auslastung</button>
+        </div>
 
-    <div id="gantt-wrapper">
-        <div id="gantt-filter"></div>
-        <div id="gantt"></div>
-        <div id="gantt-legend"></div>
+        <div class="tab-panel aktiv" id="tab-tagesliste" role="tabpanel">
+            <pre id="output"></pre>
+        </div>
+
+        <div class="tab-panel" id="tab-gantt" role="tabpanel">
+            <div id="gantt-wrapper">
+                <div id="gantt-filter"></div>
+                <div id="gantt"></div>
+                <div id="gantt-legend"></div>
+            </div>
+        </div>
+
+        <div class="tab-panel" id="tab-auslastung" role="tabpanel">
+            <div id="auslastung"></div>
+        </div>
     </div>
-
-    <div id="auslastung"></div>
 
     <!-- WICHTIG: type="module", damit import in solver.js funktioniert -->
     <script type="module" src="solver.js"></script>

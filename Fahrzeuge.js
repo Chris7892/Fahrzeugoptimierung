@@ -66,9 +66,21 @@ router.get('/planung', async (req, res) => {
             // ?liefprio=1
             const liefprioAktiv = req.query.liefprio === '1';
 
+            // Abwesenheiten (Urlaub/Krank): ?abwesenheiten=[{"abteilung":"Lack","von":"2026-10-13",
+            // "bis":"2026-10-15","anzahl":1}, ...] - JSON-codiert, aus der GUI-Eingabeliste
+            let abwesenheiten = [];
+            if (req.query.abwesenheiten) {
+                try {
+                    abwesenheiten = JSON.parse(req.query.abwesenheiten);
+                    if (!Array.isArray(abwesenheiten)) throw new Error('kein Array');
+                } catch {
+                    return res.status(400).json({ error: 'abwesenheiten muss ein JSON-Array sein' });
+                }
+            }
+
             const auftraege = await ladeAuftraege();
             res.json({
-                ...excelToModel(auftraege, { kapazitaet, maxProFahrzeug, start, horizontTage, liefprioAktiv }),
+                ...excelToModel(auftraege, { kapazitaet, maxProFahrzeug, start, horizontTage, liefprioAktiv, abwesenheiten }),
                 quelle: 'Excel'
             });
         } catch (xlsErr) {
@@ -133,8 +145,29 @@ function erstesBearbeitungsTag(start, anlieferungIso) {
     return werktageBis(start, vortag) + 1;
 }
 
+// Abteilung -> Tag -> Anzahl abwesender Mitarbeiter, aus der Rohliste {abteilung, von, bis, anzahl}.
+// Unbekannte Abteilungen oder ungueltige Datumsangaben werden stillschweigend uebersprungen.
+function kapAbzugAusListe(abwesenheiten, startDatum, abteilungen) {
+    const kapAbzug = {};
+    for (const a of abwesenheiten ?? []) {
+        if (!abteilungen.includes(a?.abteilung)) continue;
+        const anzahl = Number(a.anzahl);
+        const von = a.von ? new Date(a.von) : null;
+        const bis = a.bis ? new Date(a.bis) : null;
+        if (!(anzahl > 0) || !von || !bis || Number.isNaN(von.getTime()) || Number.isNaN(bis.getTime())) continue;
+
+        const vonTag = Math.max(1, werktageBis(startDatum, von));
+        const bisTag = werktageBis(startDatum, bis);
+        for (let t = vonTag; t <= bisTag; t++) {
+            kapAbzug[a.abteilung] ??= {};
+            kapAbzug[a.abteilung][t] = (kapAbzug[a.abteilung][t] || 0) + anzahl;
+        }
+    }
+    return kapAbzug;
+}
+
 // Auftraege aus der Excel-Datei -> Datenstruktur fuer solver.js
-export function excelToModel(auftraege, { kapazitaet, maxProFahrzeug = Infinity, start, horizontTage = STANDARD_HORIZONT_TAGE, liefprioAktiv = false } = {}) {
+export function excelToModel(auftraege, { kapazitaet, maxProFahrzeug = Infinity, start, horizontTage = STANDARD_HORIZONT_TAGE, liefprioAktiv = false, abwesenheiten = [] } = {}) {
     // Ohne Angabe: heutiges Datum (lokal) als UTC-Mitternacht
     const jetzt = new Date();
     const startDatum = start
@@ -166,6 +199,8 @@ export function excelToModel(auftraege, { kapazitaet, maxProFahrzeug = Infinity,
 
     const fahrzeuge = gewaehlt.map(a => a.id);
     const abteilungen = [...new Set(gewaehlt.flatMap(a => Object.keys(a.stunden)))];
+    // Abwesenheiten (Urlaub/Krank) -> Tageskapazitaet je Abteilung; siehe kapTag() in solver.js
+    const kapAbzug = kapAbzugAusListe(abwesenheiten, startDatum, abteilungen);
 
     const aufwand = {};
     const deadline = {};
@@ -212,8 +247,11 @@ export function excelToModel(auftraege, { kapazitaet, maxProFahrzeug = Infinity,
     const tageAbteilung = abteilungen.map(j => {
         const mitAufwand = fahrzeuge.filter(i => aufwand[`${i}_${j}`] > 0);
         const fruehester = Math.min(...mitAufwand.map(i => verfuegbarAb[i]));
+        // Durch Abwesenheiten verlorene Mitarbeiter-Tage grob mit einrechnen (je Tag hoechstens
+        // die volle Kapazitaet, mehr kann nicht verloren gehen), sonst reicht T u.U. nicht aus
+        const verlorenGesamt = Object.values(kapAbzug[j] ?? {}).reduce((s, v) => s + Math.min(v, kap[j]), 0);
         return (Number.isFinite(fruehester) ? fruehester - 1 : 0)
-            + Math.ceil(mitAufwand.reduce((sum, i) => sum + aufwand[`${i}_${j}`], 0) / kap[j]);
+            + Math.ceil((mitAufwand.reduce((sum, i) => sum + aufwand[`${i}_${j}`], 0) + verlorenGesamt) / kap[j]);
     });
     const tageFahrzeug = fahrzeuge.map(i => verfuegbarAb[i] - 1 +
         abteilungen.reduce((sum, j) =>
@@ -225,7 +263,7 @@ export function excelToModel(auftraege, { kapazitaet, maxProFahrzeug = Infinity,
     for (const a of gewaehlt) deadline[a.id] ??= T;
 
     return { fahrzeuge, abteilungen, aufwand, deadline, verfuegbarAb, kapazitaet: kap, T, bezeichnung, info, maxProFahrzeug,
-        prio, liefprioAktiv,
+        prio, liefprioAktiv, kapAbzug,
         anzahlAuftraege: auftraege.length,
         startDatum: startDatum.toISOString().slice(0, 10) };
 }
